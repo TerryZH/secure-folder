@@ -1,0 +1,336 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# secure-folder: macOS encrypted folder tool backed by an encrypted disk image.
+# Requires macOS built-ins: hdiutil, diskutil, df, open.
+
+DEFAULT_CONTENT_PATH="${HOME}/.secure-folder/content.sparsebundle"
+DEFAULT_MOUNT_PATH="${HOME}/SecureFolder"
+DEFAULT_SIZE="10g"
+DEFAULT_VOLUME_NAME="SecureFolder"
+DEFAULT_IMAGE_TYPE="SPARSEBUNDLE"  # Preferred for persistent growable storage.
+
+CONTENT_PATH=""
+MOUNT_PATH=""
+SIZE="${DEFAULT_SIZE}"
+VOLUME_NAME="${DEFAULT_VOLUME_NAME}"
+IMAGE_TYPE="${DEFAULT_IMAGE_TYPE}"
+NO_OPEN=0
+CONTENT_SPECIFIED=0
+MOUNT_SPECIFIED=0
+SIZE_SPECIFIED=0
+
+usage() {
+  cat <<USAGE
+secure-folder - encrypted read/write folder for macOS
+
+Usage:
+  secure-folder setup [--content PATH] [--mount PATH] [--size SIZE] [--name NAME] [--single-file] [--no-open]
+  secure-folder open  [--content PATH] [--mount PATH] [--name NAME] [--no-open]
+  secure-folder close [--mount PATH]
+  secure-folder status [--content PATH] [--mount PATH]
+  secure-folder compact [--content PATH]
+  secure-folder change-password [--content PATH]
+
+Defaults:
+  content container: ${DEFAULT_CONTENT_PATH}
+  mount folder:      ${DEFAULT_MOUNT_PATH}
+  max size:          ${DEFAULT_SIZE}
+
+Notes:
+  - The default container is a .sparsebundle package. It appears as one item in Finder
+    but is internally a directory of encrypted bands; this is Apple's preferred
+    persistent sparse-image format.
+  - Use --single-file during setup to create a .sparseimage instead. A sparseimage is
+    one physical file, but sparsebundle is generally safer for long-lived storage.
+  - Passwords are read silently and passed to hdiutil through stdin, not command-line
+    arguments. They are not stored by this tool.
+USAGE
+}
+
+fail() {
+  printf 'Error: %s\n' "$*" >&2
+  exit 1
+}
+
+need_macos() {
+  [[ "$(uname -s)" == "Darwin" ]] || fail "This tool is for macOS only."
+  command -v hdiutil >/dev/null 2>&1 || fail "hdiutil not found."
+  command -v diskutil >/dev/null 2>&1 || fail "diskutil not found."
+}
+
+expand_tilde() {
+  local path="$1"
+  if [[ "$path" == "~" ]]; then
+    printf '%s' "$HOME"
+  elif [[ "$path" == ~/* ]]; then
+    printf '%s/%s' "$HOME" "${path#~/}"
+  else
+    printf '%s' "$path"
+  fi
+}
+
+prompt_with_default() {
+  local label="$1"
+  local default="$2"
+  local value=""
+  printf '%s [%s]: ' "$label" "$default" >&2
+  IFS= read -r value
+  printf '%s' "${value:-$default}"
+}
+
+read_secret() {
+  local label="$1"
+  local value=""
+  printf '%s' "$label" >&2
+  IFS= read -r -s value
+  printf '\n' >&2
+  printf '%s' "$value"
+}
+
+ensure_reasonable_password() {
+  local password="$1"
+  if ((${#password} < 12)); then
+    fail "Password must be at least 12 characters. Use a long passphrase; 16+ is better."
+  fi
+}
+
+password_to_hdiutil() {
+  local password="$1"
+  shift
+  # hdiutil -stdinpass expects a NUL-terminated passphrase.
+  printf '%s\0' "$password" | hdiutil "$@"
+}
+
+mounted_at() {
+  local mount_path="$1"
+  mount | grep -F " on ${mount_path} " >/dev/null 2>&1
+}
+
+mounted_device_for_path() {
+  local mount_path="$1"
+  df -P "$mount_path" 2>/dev/null | awk 'NR == 2 {print $1}'
+}
+
+parse_args() {
+  CONTENT_SPECIFIED=0
+  MOUNT_SPECIFIED=0
+  SIZE_SPECIFIED=0
+  while (($#)); do
+    case "$1" in
+      --content)
+        [[ $# -ge 2 ]] || fail "--content requires a path."
+        CONTENT_PATH="$(expand_tilde "$2")"
+        CONTENT_SPECIFIED=1
+        shift 2
+        ;;
+      --mount)
+        [[ $# -ge 2 ]] || fail "--mount requires a path."
+        MOUNT_PATH="$(expand_tilde "$2")"
+        MOUNT_SPECIFIED=1
+        shift 2
+        ;;
+      --size)
+        [[ $# -ge 2 ]] || fail "--size requires a value, e.g. 10g."
+        SIZE="$2"
+        SIZE_SPECIFIED=1
+        shift 2
+        ;;
+      --name)
+        [[ $# -ge 2 ]] || fail "--name requires a volume name."
+        VOLUME_NAME="$2"
+        shift 2
+        ;;
+      --single-file)
+        IMAGE_TYPE="SPARSE"
+        if [[ -z "$CONTENT_PATH" ]]; then
+          CONTENT_PATH="${HOME}/.secure-folder/content.sparseimage"
+        fi
+        CONTENT_SPECIFIED=1
+        shift
+        ;;
+      --no-open)
+        NO_OPEN=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        fail "Unknown option: $1"
+        ;;
+    esac
+  done
+  CONTENT_PATH="${CONTENT_PATH:-$DEFAULT_CONTENT_PATH}"
+  MOUNT_PATH="${MOUNT_PATH:-$DEFAULT_MOUNT_PATH}"
+}
+
+setup_cmd() {
+  parse_args "$@"
+  need_macos
+  umask 077
+
+  if ((CONTENT_SPECIFIED == 0)); then
+    CONTENT_PATH="$(expand_tilde "$(prompt_with_default 'Encrypted content container path' "$CONTENT_PATH")")"
+  fi
+  if ((MOUNT_SPECIFIED == 0)); then
+    MOUNT_PATH="$(expand_tilde "$(prompt_with_default 'Mount folder path' "$MOUNT_PATH")")"
+  fi
+  if ((SIZE_SPECIFIED == 0)); then
+    SIZE="$(prompt_with_default 'Maximum container size' "$SIZE")"
+  fi
+
+  [[ -e "$CONTENT_PATH" ]] && fail "Content container already exists: $CONTENT_PATH"
+  [[ -e "$MOUNT_PATH" ]] && mounted_at "$MOUNT_PATH" && fail "Mount folder is already mounted: $MOUNT_PATH"
+
+  mkdir -p "$(dirname "$CONTENT_PATH")" "$MOUNT_PATH"
+  chmod 700 "$(dirname "$CONTENT_PATH")" "$MOUNT_PATH" 2>/dev/null || true
+
+  local p1 p2
+  p1="$(read_secret 'Create password: ')"
+  p2="$(read_secret 'Confirm password: ')"
+  [[ "$p1" == "$p2" ]] || fail "Passwords do not match."
+  ensure_reasonable_password "$p1"
+
+  printf 'Creating encrypted container at %s ...\n' "$CONTENT_PATH" >&2
+  password_to_hdiutil "$p1" create \
+    -quiet \
+    -stdinpass \
+    -encryption AES-256 \
+    -type "$IMAGE_TYPE" \
+    -fs APFS \
+    -volname "$VOLUME_NAME" \
+    -size "$SIZE" \
+    "$CONTENT_PATH"
+
+  printf 'Mounting once to initialize the folder ...\n' >&2
+  password_to_hdiutil "$p1" attach \
+    -quiet \
+    -stdinpass \
+    -mountpoint "$MOUNT_PATH" \
+    "$CONTENT_PATH"
+
+  cat > "$MOUNT_PATH/README.txt" <<README
+This folder is backed by an encrypted macOS disk image.
+
+Close it with:
+  secure-folder close --mount "$MOUNT_PATH"
+
+Open it later with:
+  secure-folder open --content "$CONTENT_PATH" --mount "$MOUNT_PATH"
+
+Migration to another Mac:
+  1. Close this folder first:
+       secure-folder close --mount "$MOUNT_PATH"
+  2. Copy the encrypted content container, not this mounted folder:
+       $CONTENT_PATH
+  3. On the other Mac, install secure-folder and open the copied container with:
+       secure-folder open --content "$CONTENT_PATH" --mount "$MOUNT_PATH"
+
+If the container is a .sparsebundle, copy the whole .sparsebundle package intact.
+If the container is a .sparseimage, copy that single .sparseimage file.
+README
+
+  printf 'Setup complete. Your secure folder is mounted at %s\n' "$MOUNT_PATH" >&2
+  if ((NO_OPEN == 0)); then
+    open "$MOUNT_PATH" >/dev/null 2>&1 || true
+  fi
+}
+
+open_cmd() {
+  parse_args "$@"
+  need_macos
+  [[ -e "$CONTENT_PATH" ]] || fail "Content container not found: $CONTENT_PATH"
+  mkdir -p "$MOUNT_PATH"
+  chmod 700 "$MOUNT_PATH" 2>/dev/null || true
+  mounted_at "$MOUNT_PATH" && fail "Already mounted at: $MOUNT_PATH"
+
+  local p
+  p="$(read_secret 'Password: ')"
+  printf 'Unlocking and mounting %s ...\n' "$CONTENT_PATH" >&2
+  password_to_hdiutil "$p" attach \
+    -quiet \
+    -stdinpass \
+    -mountpoint "$MOUNT_PATH" \
+    "$CONTENT_PATH" || fail "Could not unlock or mount. Wrong password, corrupted container, or busy mount point."
+
+  printf 'Mounted at %s\n' "$MOUNT_PATH" >&2
+  if ((NO_OPEN == 0)); then
+    open "$MOUNT_PATH" >/dev/null 2>&1 || true
+  fi
+}
+
+close_cmd() {
+  parse_args "$@"
+  need_macos
+  [[ -d "$MOUNT_PATH" ]] || fail "Mount folder does not exist: $MOUNT_PATH"
+
+  local dev
+  dev="$(mounted_device_for_path "$MOUNT_PATH")"
+  [[ -n "$dev" ]] || fail "Nothing appears to be mounted at: $MOUNT_PATH"
+
+  printf 'Flushing and detaching %s ...\n' "$MOUNT_PATH" >&2
+  sync
+  hdiutil detach "$dev" >/dev/null || fail "Could not detach. Close open files in the secure folder and try again."
+  printf 'Closed %s\n' "$MOUNT_PATH" >&2
+}
+
+status_cmd() {
+  parse_args "$@"
+  need_macos
+  printf 'Content container: %s\n' "$CONTENT_PATH"
+  if [[ -e "$CONTENT_PATH" ]]; then
+    printf 'Container exists: yes\n'
+  else
+    printf 'Container exists: no\n'
+  fi
+  printf 'Mount folder: %s\n' "$MOUNT_PATH"
+  if mounted_at "$MOUNT_PATH"; then
+    printf 'Mounted: yes\n'
+    mounted_device_for_path "$MOUNT_PATH" | awk '{print "Device: " $0}'
+  else
+    printf 'Mounted: no\n'
+  fi
+}
+
+compact_cmd() {
+  parse_args "$@"
+  need_macos
+  [[ -e "$CONTENT_PATH" ]] || fail "Content container not found: $CONTENT_PATH"
+  hdiutil compact "$CONTENT_PATH"
+}
+
+change_password_cmd() {
+  parse_args "$@"
+  need_macos
+  [[ -e "$CONTENT_PATH" ]] || fail "Content container not found: $CONTENT_PATH"
+
+  local old new1 new2
+  old="$(read_secret 'Current password: ')"
+  new1="$(read_secret 'New password: ')"
+  new2="$(read_secret 'Confirm new password: ')"
+  [[ "$new1" == "$new2" ]] || fail "New passwords do not match."
+  ensure_reasonable_password "$new1"
+
+  # hdiutil chpass supports reading old and new passphrases from stdin.
+  printf '%s\0%s\0' "$old" "$new1" | hdiutil chpass "$CONTENT_PATH" -oldstdinpass -newstdinpass
+  printf 'Password changed.\n' >&2
+}
+
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    setup) setup_cmd "$@" ;;
+    open|mount) open_cmd "$@" ;;
+    close|unmount) close_cmd "$@" ;;
+    status) status_cmd "$@" ;;
+    compact) compact_cmd "$@" ;;
+    change-password|passwd) change_password_cmd "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
